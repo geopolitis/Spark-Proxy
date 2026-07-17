@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+venv/
+data/
+*.log
+*.out
+*.pid
+proxy_metrics.json
+proxy_requests.jsonl

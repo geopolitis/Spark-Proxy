@@ -1,0 +1,8 @@
+beautifulsoup4
+fastapi
+httpx
+openai
+playwright
+playwright-stealth
+pyyaml
+uvicorn
