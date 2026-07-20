@@ -34,6 +34,7 @@ CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(os.environ.get("CIRCUIT_BREAKER_COOLDOW
 BACKEND_CONNECT_TIMEOUT_SECONDS = float(os.environ.get("BACKEND_CONNECT_TIMEOUT_SECONDS", "10"))
 BACKEND_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("BACKEND_REQUEST_TIMEOUT_SECONDS", "180"))
 STRICT_UNSUPPORTED_PARAMS = os.environ.get("STRICT_UNSUPPORTED_PARAMS", "1").lower() not in {"0", "false", "no"}
+STABILIZE_PREFIX_CACHE = os.environ.get("STABILIZE_PREFIX_CACHE", "1").lower() not in {"0", "false", "no"}
 
 DEFAULT_CONFIG = {
     "default_model": MODEL_NAME,
@@ -522,6 +523,34 @@ def sanitize_chat_body(body: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in body.items() if key in FORWARDED_CHAT_KEYS}
 
 
+def canonicalize_structured_value(value: Any) -> Any:
+    """Return an equivalent value with deterministic object-key ordering."""
+    if isinstance(value, dict):
+        return {key: canonicalize_structured_value(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [canonicalize_structured_value(item) for item in value]
+    return value
+
+
+def stabilize_prefix_cache_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalize structured prompt inputs without changing message semantics."""
+    if not STABILIZE_PREFIX_CACHE:
+        return body
+    stable = dict(body)
+    messages = stable.get("messages")
+    if isinstance(messages, list):
+        # Preserve message and content-part order; only dictionary key order changes.
+        stable["messages"] = [canonicalize_structured_value(message) for message in messages]
+    tools = stable.get("tools")
+    if isinstance(tools, list):
+        canonical_tools = [canonicalize_structured_value(tool) for tool in tools]
+        stable["tools"] = sorted(
+            canonical_tools,
+            key=lambda tool: str((tool.get("function") or {}).get("name", "")) if isinstance(tool, dict) else "",
+        )
+    return stable
+
+
 def unsupported_chat_keys(body: Dict[str, Any]) -> list[str]:
     return sorted(key for key in body if key not in CHAT_COMPLETION_KEYS)
 
@@ -978,6 +1007,7 @@ async def chat_proxy(request: Request):
 
         model_name, model_profile = resolve_model_profile(raw_body.get("model"))
         body = normalize_body_for_profile(sanitize_chat_body(raw_body), profile, model_profile)
+        body = stabilize_prefix_cache_body(body)
         validation = validate_chat_request(raw_body, body, model_name, model_profile)
         messages = body.get("messages", [])
         log_row.update({
