@@ -12,7 +12,7 @@
       "recommended_temperature": 0,
       "client_overrides": {
         "kilo": {
-          "max_tokens": 8192,
+          "max_tokens": 4096,
           "stream": true
         },
         "copilot": {
@@ -21,6 +21,30 @@
         },
         "benchmark": {
           "max_tokens": 16384
+        }
+      }
+    },
+    "qwen36-nvfp4-dflash-vllm": {
+      "backend_model": "qwen36-nvfp4-dflash-vllm",
+      "max_context_tokens": 262144,
+      "default_max_tokens": 4096,
+      "hard_max_tokens": 8192,
+      "tool_parser": "qwen3_xml",
+      "supports_tools": true,
+      "supports_stream_usage": true,
+      "supports_parallel_tools": false,
+      "recommended_temperature": 0,
+      "client_overrides": {
+        "kilo": {
+          "max_tokens": 4096,
+          "stream": true
+        },
+        "copilot": {
+          "max_tokens": 4096,
+          "parallel_tool_calls": false
+        },
+        "benchmark": {
+          "max_tokens": 8192
         }
       }
     },
@@ -36,7 +60,7 @@
       "recommended_temperature": 0,
       "client_overrides": {
         "kilo": {
-          "max_tokens": 8192,
+          "max_tokens": 4096,
           "stream": true
         },
         "copilot": {
