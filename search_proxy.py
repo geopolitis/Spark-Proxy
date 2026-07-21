@@ -23,11 +23,13 @@ CONFIG_PATH = os.environ.get("PROXY_CONFIG_PATH", "/home/geo/Gemini/models.yaml"
 REQUEST_LOG_PATH = os.environ.get("PROXY_REQUEST_LOG_PATH", "/home/geo/Gemini/proxy_requests.jsonl")
 METRICS_PATH = os.environ.get("PROXY_METRICS_PATH", "/home/geo/Gemini/proxy_metrics.json")
 MAX_REQUEST_BYTES = int(os.environ.get("MAX_REQUEST_BYTES", str(24 * 1024 * 1024)))
-STREAM_INACTIVITY_TIMEOUT_SECONDS = float(os.environ.get("STREAM_INACTIVITY_TIMEOUT_SECONDS", "120"))
+STREAM_INACTIVITY_TIMEOUT_SECONDS = float(os.environ.get("STREAM_INACTIVITY_TIMEOUT_SECONDS", "300"))
 FORCE_STREAM_USAGE = os.environ.get("FORCE_STREAM_USAGE", "1").lower() not in {"0", "false", "no"}
 DEFAULT_CLIENT_PROFILE = os.environ.get("DEFAULT_CLIENT_PROFILE", "generic").strip().lower() or "generic"
 COPILOT_MAX_OUTPUT_TOKENS = int(os.environ.get("COPILOT_MAX_OUTPUT_TOKENS", "4096"))
-KILO_MAX_OUTPUT_TOKENS = int(os.environ.get("KILO_MAX_OUTPUT_TOKENS", "8192"))
+KILO_MAX_OUTPUT_TOKENS = int(os.environ.get("KILO_MAX_OUTPUT_TOKENS", "4096"))
+KILO_MAX_CONTEXT_TOKENS = int(os.environ.get("KILO_MAX_CONTEXT_TOKENS", "131072"))
+KILO_MAX_CONCURRENT_STREAMS = int(os.environ.get("KILO_MAX_CONCURRENT_STREAMS", "1"))
 CIRCUIT_BREAKER_FAILURES = int(os.environ.get("CIRCUIT_BREAKER_FAILURES", "5"))
 CIRCUIT_BREAKER_WINDOW_SECONDS = float(os.environ.get("CIRCUIT_BREAKER_WINDOW_SECONDS", "60"))
 CIRCUIT_BREAKER_COOLDOWN_SECONDS = float(os.environ.get("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "30"))
@@ -50,7 +52,7 @@ DEFAULT_CONFIG = {
             "supports_parallel_tools": False,
             "recommended_temperature": 0,
             "client_overrides": {
-                "kilo": {"max_tokens": 8192, "stream": True},
+                "kilo": {"max_tokens": 4096, "stream": True},
                 "copilot": {"max_tokens": 4096, "parallel_tool_calls": False},
             },
         },
@@ -64,6 +66,22 @@ DEFAULT_CONFIG = {
             "supports_stream_usage": True,
             "supports_parallel_tools": False,
             "recommended_temperature": 0,
+        },
+        "qwen36-nvfp4-dflash-vllm": {
+            "backend_model": "qwen36-nvfp4-dflash-vllm",
+            "max_context_tokens": 262144,
+            "default_max_tokens": 4096,
+            "hard_max_tokens": 8192,
+            "supports_tools": True,
+            "tool_parser": "qwen3_xml",
+            "supports_stream_usage": True,
+            "supports_parallel_tools": False,
+            "recommended_temperature": 0,
+            "client_overrides": {
+                "kilo": {"max_tokens": 4096, "stream": True},
+                "copilot": {"max_tokens": 4096, "parallel_tool_calls": False},
+                "benchmark": {"max_tokens": 8192},
+            },
         },
     },
     "client_profiles": {
@@ -141,6 +159,8 @@ STATS = {
 RECENT_SEARCHES = deque(maxlen=25)
 RECENT_REQUESTS = deque(maxlen=50)
 RECENT_FAILURES = deque(maxlen=50)
+KILO_STREAM_LOCK = asyncio.Lock()
+KILO_ACTIVE_STREAMS = 0
 
 
 def load_proxy_config() -> Dict[str, Any]:
@@ -516,6 +536,21 @@ CHAT_COMPLETION_KEYS = {
     "profile",
 }
 FORWARDED_CHAT_KEYS = CHAT_COMPLETION_KEYS - {"client_profile", "client", "profile", "parallel_tool_calls"}
+CHAT_PARAMETER_ALIASES = {
+    "maxOutputTokens": "max_tokens",
+    "max_output_tokens": "max_tokens",
+}
+
+
+def normalize_chat_parameter_aliases(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate common client parameter aliases before strict validation."""
+    normalized = dict(body)
+    for alias, canonical in CHAT_PARAMETER_ALIASES.items():
+        if alias not in normalized:
+            continue
+        normalized.setdefault(canonical, normalized[alias])
+        normalized.pop(alias, None)
+    return normalized
 
 
 def sanitize_chat_body(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -673,7 +708,7 @@ def normalize_body_for_profile(body: Dict[str, Any], profile: str, model_profile
     return normalized
 
 
-def validate_chat_request(raw_body: Dict[str, Any], body: Dict[str, Any], model_name: str, model_profile: Dict[str, Any]):
+def validate_chat_request(raw_body: Dict[str, Any], body: Dict[str, Any], model_name: str, model_profile: Dict[str, Any], profile: str):
     if STRICT_UNSUPPORTED_PARAMS:
         unsupported = unsupported_chat_keys(raw_body)
         if unsupported:
@@ -682,6 +717,8 @@ def validate_chat_request(raw_body: Dict[str, Any], body: Dict[str, Any], model_
     if not isinstance(messages, list) or not messages:
         raise HTTPException(status_code=400, detail="messages must be a non-empty array")
     max_context = int(model_profile.get("max_context_tokens") or 0)
+    if profile == "kilo" and KILO_MAX_CONTEXT_TOKENS > 0:
+        max_context = min(max_context, KILO_MAX_CONTEXT_TOKENS) if max_context else KILO_MAX_CONTEXT_TOKENS
     prompt_tokens = estimate_prompt_tokens(messages)
     output_tokens = output_token_value(body) or int(model_profile.get("default_max_tokens") or 4096)
     if max_context and prompt_tokens + output_tokens > max_context:
@@ -695,6 +732,34 @@ def validate_chat_request(raw_body: Dict[str, Any], body: Dict[str, Any], model_
             ),
         )
     return {"model": model_name, "prompt_tokens_estimated": prompt_tokens, "output_tokens": output_tokens, "max_context_tokens": max_context}
+
+
+async def acquire_kilo_stream_slot() -> bool:
+    global KILO_ACTIVE_STREAMS
+    if KILO_MAX_CONCURRENT_STREAMS <= 0:
+        return True
+    async with KILO_STREAM_LOCK:
+        if KILO_ACTIVE_STREAMS >= KILO_MAX_CONCURRENT_STREAMS:
+            return False
+        KILO_ACTIVE_STREAMS += 1
+        return True
+
+
+async def release_kilo_stream_slot():
+    global KILO_ACTIVE_STREAMS
+    if KILO_MAX_CONCURRENT_STREAMS <= 0:
+        return
+    async with KILO_STREAM_LOCK:
+        KILO_ACTIVE_STREAMS = max(0, KILO_ACTIVE_STREAMS - 1)
+
+
+async def guarded_backend_stream(http_client: httpx.AsyncClient, response: httpx.Response, release_kilo_slot: bool):
+    try:
+        async for chunk in stream_backend_raw(http_client, response):
+            yield chunk
+    finally:
+        if release_kilo_slot:
+            await release_kilo_stream_slot()
 
 
 def sse_event(data: str) -> str:
@@ -999,6 +1064,7 @@ async def chat_proxy(request: Request):
             raw_body = json.loads(raw_bytes.decode("utf-8"))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Malformed JSON request body: {exc}")
+        raw_body = normalize_chat_parameter_aliases(raw_body)
 
         detected_profile = detect_client_profile(request, raw_body)
         profile = detected_profile["name"]
@@ -1008,7 +1074,7 @@ async def chat_proxy(request: Request):
         model_name, model_profile = resolve_model_profile(raw_body.get("model"))
         body = normalize_body_for_profile(sanitize_chat_body(raw_body), profile, model_profile)
         body = stabilize_prefix_cache_body(body)
-        validation = validate_chat_request(raw_body, body, model_name, model_profile)
+        validation = validate_chat_request(raw_body, body, model_name, model_profile, profile)
         messages = body.get("messages", [])
         log_row.update({
             "client_profile": profile,
@@ -1023,10 +1089,24 @@ async def chat_proxy(request: Request):
 
         if body.get("stream"):
             await update_stats(stream_requests_inc=1)
-            http_client, response = await open_backend_stream(body)
+            holds_kilo_slot = False
+            if profile == "kilo":
+                holds_kilo_slot = await acquire_kilo_stream_slot()
+                if not holds_kilo_slot:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="A Kilo generation is already active on this node. Cancel it before retrying.",
+                        headers={"Retry-After": "5"},
+                    )
+            try:
+                http_client, response = await open_backend_stream(body)
+            except Exception:
+                if holds_kilo_slot:
+                    await release_kilo_stream_slot()
+                raise
             await append_request_log({**log_row, "status": "stream_started"})
             return StreamingResponse(
-                stream_backend_raw(http_client, response),
+                guarded_backend_stream(http_client, response, holds_kilo_slot),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache, no-transform",

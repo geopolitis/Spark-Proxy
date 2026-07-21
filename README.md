@@ -13,6 +13,8 @@ The gateway sits between clients such as Kilo Code, Copilot LLM Gateway, Open We
 - OpenAI-style translated errors
 - Safe retry before stream start only
 - Circuit breaker for repeated backend failures
+- Kilo request-storm protection with one active stream per node by default
+- Kilo-specific 128K context and 4K output safety limits
 - Per-request IDs and JSONL structured logs
 - Persisted metrics and Prometheus `/metrics`
 - Diagnostics endpoints for vLLM health, streaming, model load, and recent failures
